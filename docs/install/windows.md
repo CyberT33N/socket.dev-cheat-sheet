@@ -2,6 +2,7 @@ Die belastbare Aussage ist: `sfw` ist nicht nur fuer `install` gedacht. Dokument
 
 `⚠️ ANNAHME:` Die konkrete Signatur von `MPMI-Global` ist in deinen Quellen nicht oeffentlich dokumentiert. Das Skript nutzt deshalb standardmaessig `MPMI-Global sfw`. Falls dein lokaler Vertrag anders aussieht, passe nur `-MpmiArguments` an. Geprueft habe ich das Skript in `powershell.exe` mit `-WhatIf`; dabei wurde die vorhandene `sfw`-Version korrekt ueber die Versionsausgabe erkannt und nur der Profilblock als geplante Aenderung ausgewiesen.
 
+install.ps1:
 ```powershell
 <#
 .SYNOPSIS
@@ -11,8 +12,10 @@ Checks whether `sfw` is installed by evaluating `sfw --version`. If no version i
 available, the script invokes the global `MPMI-Global` command to install SWF.
 Afterwards it verifies that the PowerShell profile contains a managed wrapper block
 for all documented SWF package-manager entry points: npm, yarn, pnpm, pip, uv,
-and cargo. The wrapper block is added only once and logs every proxied call with
-an explicit `swf inception` message.
+and cargo. The managed wrapper resolves concrete launcher files such as `.cmd`
+or `.exe` shims on Windows instead of forwarding logical command names, so
+redirected hosts such as Cursor, IDE terminals, and automation shells do not
+deadlock on PowerShell-based package-manager shims.
 .NOTES
 Adjust -MpmiArguments if your local MPMI-Global contract expects a different
 argument shape than the default package-name form.
@@ -43,6 +46,10 @@ $profileBlockStart = '# >>> swf inception wrapper >>>'
 $profileBlockEnd = '# <<< swf inception wrapper <<<'
 $managedBlockRequiredSnippets = @(
     'function Invoke-SfwInception',
+    'function Test-SfwWindowsPlatform',
+    'function Resolve-SfwCommandPath',
+    'function Get-SfwExecutablePath',
+    'function Get-SfwPackageManagerExecutablePath',
     'function npm',
     'function yarn',
     'function pnpm',
@@ -210,6 +217,133 @@ function Format-SfwInceptionCommandLine {
     $tokens -join ' '
 }
 
+function Test-SfwWindowsPlatform {
+    [CmdletBinding()]
+    param()
+
+    return ($env:OS -eq 'Windows_NT')
+}
+
+function Resolve-SfwCommandPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$CommandNames,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Purpose,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$AllowedCommandTypes = @('Application', 'ExternalScript')
+    )
+
+    foreach ($commandName in $CommandNames) {
+        $matches = @(
+            Get-Command -Name $commandName -All -ErrorAction SilentlyContinue | Where-Object {
+                ($AllowedCommandTypes -contains $_.CommandType.ToString()) -and
+                (-not [string]::IsNullOrWhiteSpace($_.Definition))
+            }
+        )
+
+        if ($matches.Count -eq 0) {
+            continue
+        }
+
+        $orderedMatches = @(
+            $matches | Sort-Object `
+                @{ Expression = {
+                    switch ($_.CommandType.ToString()) {
+                        'Application'    { 0 }
+                        'ExternalScript' { 1 }
+                        default          { 2 }
+                    }
+                } },
+                @{ Expression = { $_.Name } }
+        )
+
+        if ($orderedMatches.Count -gt 0) {
+            return $orderedMatches[0].Definition
+        }
+    }
+
+    throw ("Unable to resolve the {0}. Checked command candidates: {1}." -f $Purpose, ($CommandNames -join ', '))
+}
+
+function Get-SfwExecutablePath {
+    [CmdletBinding()]
+    param()
+
+    if (Test-SfwWindowsPlatform) {
+        return Resolve-SfwCommandPath -CommandNames @('sfw.cmd', 'sfw.exe') -Purpose 'Socket Firewall executable on Windows' -AllowedCommandTypes @('Application')
+    }
+
+    return Resolve-SfwCommandPath -CommandNames @('sfw') -Purpose 'Socket Firewall executable'
+}
+
+function Get-SfwPackageManagerExecutablePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('npm', 'yarn', 'pnpm', 'pip', 'uv', 'cargo')]
+        [string]$PackageManager
+    )
+
+    $commandCandidates = @()
+    $allowedCommandTypes = @('Application', 'ExternalScript')
+
+    if (Test-SfwWindowsPlatform) {
+        $allowedCommandTypes = @('Application')
+
+        switch ($PackageManager) {
+            'npm' {
+                $commandCandidates = @('npm.cmd', 'npm.exe')
+            }
+            'yarn' {
+                $commandCandidates = @('yarn.cmd', 'yarn.exe')
+            }
+            'pnpm' {
+                $commandCandidates = @('pnpm.cmd', 'pnpm.exe')
+            }
+            'pip' {
+                $commandCandidates = @('pip.exe', 'pip3.exe', 'pip.cmd')
+            }
+            'uv' {
+                $commandCandidates = @('uv.exe', 'uv.cmd')
+            }
+            'cargo' {
+                $commandCandidates = @('cargo.exe', 'cargo.cmd')
+            }
+        }
+
+        return Resolve-SfwCommandPath -CommandNames $commandCandidates -Purpose ("safe {0} launcher on Windows" -f $PackageManager) -AllowedCommandTypes $allowedCommandTypes
+    }
+
+    switch ($PackageManager) {
+        'npm' {
+            $commandCandidates = @('npm')
+        }
+        'yarn' {
+            $commandCandidates = @('yarn')
+        }
+        'pnpm' {
+            $commandCandidates = @('pnpm')
+        }
+        'pip' {
+            $commandCandidates = @('pip', 'pip3')
+        }
+        'uv' {
+            $commandCandidates = @('uv')
+        }
+        'cargo' {
+            $commandCandidates = @('cargo')
+        }
+    }
+
+    return Resolve-SfwCommandPath -CommandNames $commandCandidates -Purpose ("{0} executable" -f $PackageManager) -AllowedCommandTypes $allowedCommandTypes
+}
+
 function Invoke-SfwInception {
     [CmdletBinding()]
     param(
@@ -222,17 +356,17 @@ function Invoke-SfwInception {
         [object[]]$Arguments = @()
     )
 
-    $sfwCommand = Get-Command -Name 'sfw' -ErrorAction SilentlyContinue
-    if (-not $sfwCommand) {
-        throw "The 'sfw' command was not found in PATH. Run the SWF bootstrap script first."
-    }
+    # Resolve concrete launcher files so redirected IDE hosts never fall back
+    # to PowerShell shims such as npm.ps1/pnpm.ps1 that can block on stdin.
+    $sfwExecutablePath = Get-SfwExecutablePath
+    $packageManagerExecutablePath = Get-SfwPackageManagerExecutablePath -PackageManager $PackageManager
 
-    $forwardedArguments = @($PackageManager) + @($Arguments)
+    $forwardedArguments = @($packageManagerExecutablePath) + @($Arguments)
     $displayCommandLine = Format-SfwInceptionCommandLine -Arguments $forwardedArguments
 
-    Write-SfwInceptionLog -Message ("Proxying package manager command through Socket Firewall Free: sfw {0}" -f $displayCommandLine)
+    Write-SfwInceptionLog -Message ("Proxying package manager command through Socket Firewall Free: {0} {1}" -f $sfwExecutablePath, $displayCommandLine)
 
-    & 'sfw' @forwardedArguments
+    & $sfwExecutablePath @forwardedArguments
 }
 
 function npm {
@@ -310,6 +444,7 @@ function Test-SfwProfileBlockPresent {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
         [string]$ProfileContent,
 
         [Parameter(Mandatory = $true)]
@@ -348,14 +483,14 @@ function Test-SfwProfileBlockPresent {
 
     foreach ($snippet in $RequiredSnippets) {
         if ($existingBlock.IndexOf($snippet, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
-            throw 'Detected an incomplete or manually modified SWF-managed profile block. Remove the existing block and re-run the script.'
+            throw 'Detected an incomplete, stale, or manually modified SWF-managed profile block. Remove the existing block and re-run the script.'
         }
     }
 
     return $true
 }
 
-function Ensure-ProfileParentDirectory {
+function Initialize-ProfileParentDirectory {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -411,7 +546,7 @@ else {
     Write-SetupLog -Level 'WARN' -Message ("The managed SWF wrapper block is missing from profile '{0}'." -f $ProfilePath)
 
     if ($PSCmdlet.ShouldProcess($ProfilePath, 'Create or update profile with SWF wrapper block')) {
-        Ensure-ProfileParentDirectory -Path $ProfilePath
+        Initialize-ProfileParentDirectory -Path $ProfilePath
 
         $profileBlock = Get-SfwProfileBlock -BlockStart $profileBlockStart -BlockEnd $profileBlockEnd
         if ([string]::IsNullOrWhiteSpace($profileContent)) {
